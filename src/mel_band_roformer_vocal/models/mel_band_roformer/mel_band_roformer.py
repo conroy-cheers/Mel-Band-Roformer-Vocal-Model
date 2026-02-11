@@ -10,9 +10,7 @@ from .attend import Attend
 from beartype.typing import Tuple, Optional, List, Callable
 from beartype import beartype
 
-from rotary_embedding_torch import RotaryEmbedding
-
-from einops import rearrange, pack, unpack, reduce, repeat
+from einops import rearrange, reduce, repeat
 
 from librosa import filters
 
@@ -27,18 +25,100 @@ def default(v, d):
     return v if exists(v) else d
 
 
-def pack_one(t, pattern):
-    return pack([t], pattern)
-
-
-def unpack_one(t, ps, pattern):
-    return unpack(t, ps, pattern)[0]
-
-
 def pad_at_dim(t, pad, dim=-1, value=0.):
     dims_from_right = (- dim - 1) if dim < 0 else (t.ndim - dim - 1)
     zeros = ((0, 0) * dims_from_right)
     return F.pad(t, (*zeros, *pad), value=value)
+
+class SafeRotaryEmbedding(Module):
+    """
+    Minimal rotary embedding implementation.
+
+    `rotary_embedding_torch` has been observed to hard-crash on MPS in some
+    environments (likely due to torch.cat/stack issues). This implementation
+    avoids cat/stack and uses only reshape + slice assignment.
+    """
+
+    def __init__(self, dim: int, base: int = 10000):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"rotary dim must be even, got {dim}")
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def _cos_sin(self, seq_len: int, *, device: torch.device, dtype: torch.dtype):
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)  # (seq, dim/2)
+        freqs = freqs.to(dtype=dtype)
+        return freqs.cos(), freqs.sin()
+
+    def rotate_queries_or_keys(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (..., seq, dim)
+        seq_len = x.shape[-2]
+        dim = x.shape[-1]
+        half = dim // 2
+
+        cos, sin = self._cos_sin(seq_len, device=x.device, dtype=x.dtype)  # (seq, half)
+        # Broadcast to match x_pairs (..., seq, half)
+        for _ in range(x.ndim - 2):
+            cos = cos.unsqueeze(0)
+            sin = sin.unsqueeze(0)
+
+        x_pairs = x.reshape(*x.shape[:-1], half, 2)
+        x_even = x_pairs[..., 0]
+        x_odd = x_pairs[..., 1]
+
+        out_pairs = torch.empty_like(x_pairs)
+        out_pairs[..., 0] = x_even * cos - x_odd * sin
+        out_pairs[..., 1] = x_even * sin + x_odd * cos
+        return out_pairs.reshape_as(x)
+
+
+def _safe_stack(tensors, dim: int = 0):
+    """
+    torch.stack hard-crashes on MPS for some PyTorch builds.
+    Work around by preallocating and writing slices.
+    """
+    if len(tensors) == 0:
+        raise ValueError("expected at least 1 tensor to stack")
+
+    t0 = tensors[0]
+    if t0.device.type != "mps":
+        return torch.stack(tensors, dim=dim)
+
+    dim = dim if dim >= 0 else dim + t0.ndim + 1
+    out_shape = list(t0.shape)
+    out_shape.insert(dim, len(tensors))
+    out = torch.empty(out_shape, device=t0.device, dtype=t0.dtype)
+
+    for i, t in enumerate(tensors):
+        out.select(dim, i).copy_(t)
+    return out
+
+
+def _safe_cat(tensors, dim: int = 0):
+    """
+    torch.cat hard-crashes on MPS for some PyTorch builds.
+    Work around by preallocating and writing slices.
+    """
+    if len(tensors) == 0:
+        raise ValueError("expected at least 1 tensor to cat")
+
+    t0 = tensors[0]
+    if t0.device.type != "mps":
+        return torch.cat(tensors, dim=dim)
+
+    dim = dim if dim >= 0 else dim + t0.ndim
+    out_shape = list(t0.shape)
+    out_shape[dim] = sum(int(t.shape[dim]) for t in tensors)
+    out = torch.empty(out_shape, device=t0.device, dtype=t0.dtype)
+
+    start = 0
+    for t in tensors:
+        length = int(t.shape[dim])
+        out.narrow(dim, start, length).copy_(t)
+        start += length
+    return out
 
 
 # norm
@@ -189,7 +269,7 @@ class BandSplit(Module):
             split_output = to_feature(split_input)
             outs.append(split_output)
 
-        return torch.stack(outs, dim=-2)
+        return _safe_stack(outs, dim=-2)
 
 
 def MLP(
@@ -250,7 +330,7 @@ class MaskEstimator(Module):
             freq_out = mlp(band_features)
             outs.append(freq_out)
 
-        return torch.cat(outs, dim=-1)
+        return _safe_cat(outs, dim=-1)
 
 
 # main class
@@ -306,8 +386,8 @@ class MelBandRoformer(Module):
             flash_attn=flash_attn
         )
 
-        time_rotary_embed = RotaryEmbedding(dim=dim_head)
-        freq_rotary_embed = RotaryEmbedding(dim=dim_head)
+        time_rotary_embed = SafeRotaryEmbedding(dim=dim_head)
+        freq_rotary_embed = SafeRotaryEmbedding(dim=dim_head)
 
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
@@ -324,7 +404,13 @@ class MelBandRoformer(Module):
             normalized=stft_normalized
         )
 
-        freqs = torch.stft(torch.randn(1, 4096), **self.stft_kwargs, return_complex=True).shape[1]
+        # provide an explicit window to avoid spectral leakage warnings
+        freqs = torch.stft(
+            torch.randn(1, 4096),
+            **self.stft_kwargs,
+            window=self.stft_window_fn(device=torch.device("cpu")),
+            return_complex=True,
+        ).shape[1]
 
         # create mel filter bank
         # with librosa.filters.mel as in section 2 of paper
@@ -430,14 +516,16 @@ class MelBandRoformer(Module):
 
         # to stft
 
-        raw_audio, batch_audio_channel_packed_shape = pack_one(raw_audio, '* t')
+        # NOTE: einops.pack/unpack has been observed to hard-crash on MPS in some environments.
+        # We only need to flatten/unflatten (batch, channels) here, so do it explicitly.
+        raw_audio = rearrange(raw_audio, 'b s t -> (b s) t')
 
         stft_window = self.stft_window_fn(device=device)
 
         stft_repr = torch.stft(raw_audio, **self.stft_kwargs, window=stft_window, return_complex=True)
         stft_repr = torch.view_as_real(stft_repr)
 
-        stft_repr = unpack_one(stft_repr, batch_audio_channel_packed_shape, '* f t c')
+        stft_repr = rearrange(stft_repr, '(b s) f t c -> b s f t c', b=batch, s=channels)
         stft_repr = rearrange(stft_repr,
                               'b s f t c -> b (f s) t c')  # merge stereo / mono into the frequency, with frequency leading dimension, for band splitting
 
@@ -459,48 +547,57 @@ class MelBandRoformer(Module):
 
         for time_transformer, freq_transformer in self.layers:
             x = rearrange(x, 'b t f d -> b f t d')
-            x, ps = pack([x], '* t d')
+            b, f, t, d = x.shape
+            x = rearrange(x, 'b f t d -> (b f) t d')
 
             x = time_transformer(x)
 
-            x, = unpack(x, ps, '* t d')
+            x = rearrange(x, '(b f) t d -> b f t d', b=b, f=f)
             x = rearrange(x, 'b f t d -> b t f d')
-            x, ps = pack([x], '* f d')
+            b, t, f, d = x.shape
+            x = rearrange(x, 'b t f d -> (b t) f d')
 
             x = freq_transformer(x)
 
-            x, = unpack(x, ps, '* f d')
+            x = rearrange(x, '(b t) f d -> b t f d', b=b, t=t)
 
         num_stems = len(self.mask_estimators)
 
-        masks = torch.stack([fn(x) for fn in self.mask_estimators], dim=1)
+        masks = _safe_stack([fn(x) for fn in self.mask_estimators], dim=1)
         masks = rearrange(masks, 'b n t (f c) -> b n f t c', c=2)
 
         # modulate frequency representation
 
         stft_repr = rearrange(stft_repr, 'b f t c -> b 1 f t c')
 
-        # complex number multiplication
-
-        stft_repr = torch.view_as_complex(stft_repr)
-        masks = torch.view_as_complex(masks)
-
-        masks = masks.type(stft_repr.dtype)
-
         # need to average the estimated mask for the overlapped frequencies
+        #
+        # MPS does not support scatter_add_ for complex tensors. Do the scatter in
+        # real-valued representation (last dim = 2), then convert to complex.
 
-        scatter_indices = repeat(self.freq_indices, 'f -> b n f t', b=batch, n=num_stems, t=stft_repr.shape[-1])
+        scatter_indices = repeat(
+            self.freq_indices,
+            'f -> b n f t c',
+            b=batch,
+            n=num_stems,
+            t=stft_repr.shape[-2],
+            c=2,
+        )
 
-        stft_repr_expanded_stems = repeat(stft_repr, 'b 1 ... -> b n ...', n=num_stems)
+        stft_repr_expanded_stems = repeat(stft_repr, 'b 1 f t c -> b n f t c', n=num_stems)
         masks_summed = torch.zeros_like(stft_repr_expanded_stems).scatter_add_(2, scatter_indices, masks)
 
-        denom = repeat(self.num_bands_per_freq, 'f -> (f r) 1', r=channels)
+        denom = repeat(self.num_bands_per_freq, 'f -> (f r)', r=channels)
+        denom = rearrange(denom, 'f -> 1 1 f 1 1')
 
         masks_averaged = masks_summed / denom.clamp(min=1e-8)
 
-        # modulate stft repr with estimated mask
+        # complex number multiplication
+        stft_repr_complex = torch.view_as_complex(stft_repr_expanded_stems)
+        masks_complex = torch.view_as_complex(masks_averaged).type(stft_repr_complex.dtype)
 
-        stft_repr = stft_repr * masks_averaged
+        # modulate stft repr with estimated mask
+        stft_repr = stft_repr_complex * masks_complex
 
         # istft
 

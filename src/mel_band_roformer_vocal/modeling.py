@@ -20,10 +20,13 @@ def load_state_dict(model: torch.nn.Module, checkpoint_path: str) -> None:
         # lightning often prefixes with "model."
         if any(k.startswith("model.") for k in state_dict.keys()):
             state_dict = {k.removeprefix("model."): v for k, v in state_dict.items()}
-        model.load_state_dict(state_dict)
+        # rotary_embedding_torch checkpoints may contain cached `.rotary_embed.freqs` buffers
+        # which are not needed (or present) in our runtime rotary implementation.
+        state_dict = {k: v for k, v in state_dict.items() if not k.endswith("rotary_embed.freqs")}
+        model.load_state_dict(state_dict, strict=True)
         return
     if isinstance(obj, dict):
-        model.load_state_dict(obj)
+        obj = {k: v for k, v in obj.items() if not k.endswith("rotary_embed.freqs")}
+        model.load_state_dict(obj, strict=True)
         return
     raise ValueError("Unsupported checkpoint format; expected a dict or dict with 'state_dict'")
-
