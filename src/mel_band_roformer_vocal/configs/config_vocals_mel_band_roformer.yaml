@@ -37,4 +37,3 @@ training:
 inference:
   num_overlap: 2
   chunk_size: 352800
-

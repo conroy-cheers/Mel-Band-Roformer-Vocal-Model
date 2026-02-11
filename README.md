@@ -4,7 +4,50 @@ A [Mel-Band-Roformer Vocal model](https://arxiv.org/abs/2310.01809). This model 
 
 Download the model - https://huggingface.co/KimberleyJSN/melbandroformer/blob/main/MelBandRoformer.ckpt
 
-Install requirements - `pip install -r requirements.txt`
+## Install (as a package)
+
+From a clone of this repo:
+
+- `python3 -m pip install -e .`
+
+Or without editable mode:
+
+- `python3 -m pip install .`
+
+## Python API
+
+```python
+from mel_band_roformer_vocal import Separator
+
+sep = Separator(model_path="MelBandRoformer.ckpt")
+result = sep.separate_file("song.wav", "outputs")
+
+vocals = result.vocals           # np.ndarray (samples,) or (samples, 2)
+instrumental = result.instrumental
+```
+
+## CLI
+
+After install:
+
+- `mel-band-roformer-separate --model_path MelBandRoformer.ckpt --input_folder songsfolder --store_dir outputsfolder`
+
+## Nix
+
+This repo includes a `flake.nix` that fetches the checkpoint as a Nix derivation and wraps the CLI so it can run
+without a manual download (via `$MEL_BAND_ROFORMER_CKPT`).
+
+- `nix run . -- --input_folder songsfolder --store_dir outputsfolder`
+
+## Legacy (no install)
+
+- `python3 inference.py --model_path MelBandRoformer.ckpt --input_folder songsfolder --store_dir outputsfolder`
+
+## Requirements (legacy)
+
+You can still install deps directly:
+
+- `python3 -m pip install -r requirements.txt`
 
 Inference - `python inference.py --config_path configs/config_vocals_mel_band_roformer.yaml --model_path melbandroformer.ckpt --input_folder songsfolder --store_dir outputsfolder`
 
@@ -31,7 +74,5 @@ If you would like to contribute GPU access for me to train better models please 
 # Google colab
 
 https://colab.research.google.com/drive/1tyP3ZgcD443d4Q3ly7LcS3toJroLO5o1?usp=sharing
-
-
 
 
