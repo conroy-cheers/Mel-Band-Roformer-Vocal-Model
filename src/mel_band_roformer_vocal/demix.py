@@ -12,7 +12,11 @@ def _autocast(device: torch.device, enabled: bool):
     if not enabled:
         return nullcontext()
     if device.type == "cuda":
-        return torch.cuda.amp.autocast()
+        # torch.cuda.amp.autocast is deprecated in newer torch; prefer torch.amp.autocast.
+        try:
+            return torch.amp.autocast(device_type="cuda", dtype=torch.float16)
+        except Exception:
+            return torch.cuda.amp.autocast()
     if device.type == "mps":
         try:
             return torch.autocast(device_type="mps", dtype=torch.float16)

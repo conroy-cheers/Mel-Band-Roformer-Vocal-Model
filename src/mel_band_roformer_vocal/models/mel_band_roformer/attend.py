@@ -50,6 +50,13 @@ class Attend(nn.Module):
         self.cpu_config = FlashAttentionConfig(True, True, True)
         self.cuda_config = None
 
+        # `torch.cuda` is used for both CUDA and ROCm/HIP builds. However,
+        # `torch.backends.cuda.sdp_kernel` is CUDA-specific, and can error on
+        # ROCm. Treat ROCm as "no CUDA backend" here and fall back to the
+        # standard attention path (or to SDP without forcing CUDA kernels).
+        if torch.version.hip is not None:
+            return
+
         if not torch.cuda.is_available() or not flash:
             return
 
@@ -69,7 +76,13 @@ class Attend(nn.Module):
 
         # pytorch 2.0 flash attn: q, k, v, mask, dropout, softmax_scale
 
-        with torch.backends.cuda.sdp_kernel(**config._asdict()):
+        if is_cuda and torch.version.cuda is not None:
+            with torch.backends.cuda.sdp_kernel(**config._asdict()):
+                out = F.scaled_dot_product_attention(
+                    q, k, v,
+                    dropout_p = self.dropout if self.training else 0.
+                )
+        else:
             out = F.scaled_dot_product_attention(
                 q, k, v,
                 dropout_p = self.dropout if self.training else 0.

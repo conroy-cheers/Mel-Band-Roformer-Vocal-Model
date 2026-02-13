@@ -6,51 +6,38 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
         pkgs = import nixpkgs {
           inherit system;
           overlays = [
             (_final: prev: {
               buildPythonPackage =
-                if prev ? buildPythonPackage
-                then prev.buildPythonPackage
-                else prev.python3Packages.buildPythonPackage;
+                if prev ? buildPythonPackage then
+                  prev.buildPythonPackage
+                else
+                  prev.python3Packages.buildPythonPackage;
             })
           ];
+          config = {
+            rocmSupport = true;
+            cudaSupport = false;
+          };
         };
         lib = pkgs.lib;
-
-        pyPkgs = pkgs.python3Packages;
 
         melBandRoformerCheckpoint = pkgs.fetchurl {
           name = "MelBandRoformer.ckpt";
           url = "https://huggingface.co/KimberleyJSN/melbandroformer/resolve/main/MelBandRoformer.ckpt";
           hash = "sha256-hyAfTTGvtbx5mTIw/ElEaRhCVXTbSMAcQF5E82XHVZ4=";
         };
-
-        getPy = name:
-          if builtins.hasAttr name pyPkgs
-          then builtins.getAttr name pyPkgs
-          else null;
-
-        firstNonNull = xs: lib.findFirst (x: x != null) null xs;
-
-        mlCollections = firstNonNull [
-          (getPy "ml-collections")
-          (getPy "ml_collections")
-        ];
-
-        rotaryEmbeddingTorch = firstNonNull [
-          (getPy "rotary-embedding-torch")
-          (getPy "rotary_embedding_torch")
-        ];
-
-        torch = firstNonNull [
-          (getPy "torch")
-          (getPy "pytorch")
-        ];
 
         melBandRoformerVocalModel = pkgs.buildPythonPackage {
           pname = "mel-band-roformer-vocal-model";
@@ -59,22 +46,26 @@
 
           src = ./.;
 
-          nativeBuildInputs = with pyPkgs; [
-            setuptools
-            wheel
-          ] ++ [
-            pkgs.makeWrapper
-          ];
+          nativeBuildInputs =
+            with pkgs.python3Packages;
+            [
+              setuptools
+              wheel
+            ]
+            ++ [
+              pkgs.makeWrapper
+            ];
 
-          nativeCheckInputs = with pyPkgs; [
+          nativeCheckInputs = with pkgs.python3Packages; [
             pytestCheckHook
           ];
 
           doCheck = true;
           pytestFlagsArray = [ "-q" ];
 
-          propagatedBuildInputs =
-            lib.filter (x: x != null) (with pyPkgs; [
+          propagatedBuildInputs = lib.filter (x: x != null) (
+            with pkgs.python3Packages;
+            [
               numpy
               packaging
               tqdm
@@ -84,10 +75,11 @@
               einops
               pyyaml
 
-              mlCollections
-              rotaryEmbeddingTorch
+              ml-collections
+              rotary-embedding-torch
               torch
-            ]);
+            ]
+          );
 
           postFixup = ''
             if [ -x "$out/bin/mel-band-roformer-separate" ]; then
@@ -126,5 +118,6 @@
             export MEL_BAND_ROFORMER_CKPT="${melBandRoformerCheckpoint}"
           '';
         };
-      });
+      }
+    );
 }
